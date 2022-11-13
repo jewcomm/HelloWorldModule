@@ -2,6 +2,7 @@
 #include <linux/kernel.h>  
 #include <linux/fs.h>          /* Needed for KERN_INFO */
 #include <linux/init.h>       /* Needed for the macros */
+#include <linux/slab.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Alex Navrotskij");
@@ -16,7 +17,6 @@ static ssize_t device_read(struct file *, char *, size_t, loff_t *);
 static ssize_t device_write(struct file *, const char *, size_t, loff_t *);
 
 static const size_t max_buffer_len = 256;
-static char msg_buffer[256];
 static size_t msg_buffer_len = 0;
 static char *msg_ptr;
 
@@ -48,52 +48,67 @@ static int device_release(struct inode *inode, struct file *file) {
     return 0;
 }
 
-static ssize_t device_write(struct file *flip, const char *buffer, size_t len, loff_t *offset) {
-    printk(KERN_ALERT "write function\n");
+static ssize_t device_write(struct file *flip, const char __user *buffer, size_t len, loff_t *offset) {
+    size_t bytes_write; 
+
+    printk(KERN_INFO "write function\n");
     if(len > max_buffer_len) len = max_buffer_len;
+    
     msg_buffer_len = len;
-    memcpy(msg_buffer, buffer, len);
-    return 0;
+
+    bytes_write = copy_from_user(msg_ptr, buffer, msg_buffer_len);
+    printk(KERN_INFO "Len: %li", len);
+    printk(KERN_INFO "Writed: %li", msg_buffer_len - bytes_write);
+    
+    // need add check if bytes_write != 0
+
+    bytes_write = msg_buffer_len - bytes_write;
+
+    return bytes_write;
 }
 
-static ssize_t device_read(struct file *flip, char *buffer, size_t len, loff_t *offset) {
+static ssize_t device_read(struct file *flip, char __user *buffer, size_t len, loff_t *offset) {
+    int bytes_read;
+    
     printk(KERN_INFO "read function\n");
-    printk(KERN_INFO "%i", len);
 
-    int bytes_read = 0;
+    bytes_read = copy_to_user(buffer, msg_ptr, msg_buffer_len);
+    printk(KERN_INFO "buffer: %s", buffer);
+    printk(KERN_INFO "Readed: %li", msg_buffer_len - bytes_read);
 
-    if(*msg_ptr == 0){
-        msg_ptr = msg_buffer;
-    }
+    // need add check if bytes_read != 0
 
-    while (msg_buffer_len) {
-        put_user(*(msg_ptr++), buffer++);
-        msg_buffer_len--;
-        bytes_read++;
-    }
+    bytes_read = msg_buffer_len - bytes_read;
 
-    memset(msg_buffer, 0, max_buffer_len);
+    msg_buffer_len = 0;
 
     return bytes_read;
 }
 
 static int __init hello_start(void){
-    printk(KERN_INFO "Loading hello module...\n");
     major_num = register_chrdev(0, DEVICE_NAME, &fops);
-
-    msg_ptr = msg_buffer;
-
+    
     if(major_num < 0){
         printk(KERN_ALERT "Fail registration device: %d\n", major_num);
         return major_num;
-    } else {
-        printk(KERN_INFO "my_lkm module loaded with device major number %d\n", major_num);
-        return 0;
     }
+        
+    printk(KERN_INFO "my_lkm module loaded with device major number %d\n", major_num);
+
+    // allocated memory for buffer
+    msg_ptr = (char *)kmalloc(max_buffer_len * sizeof(char), GFP_USER);
+
+    if(msg_ptr == NULL) {
+        printk(KERN_ERR "ERROR! Fail allocated memory.\n");
+        return -1;
+    }
+
+    return 0;
 }
 
 static void __exit hello_end(void)
 {
+    kfree(msg_ptr);
     unregister_chrdev(major_num, DEVICE_NAME);
     printk(KERN_INFO "Goodbye Mr.\n");
 }
