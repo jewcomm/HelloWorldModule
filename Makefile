@@ -5,7 +5,7 @@ clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
 
 unload:
-	sudo rm /dev/my_lkm
+	#sudo rm /dev/my_lkm
 	sudo rmmod my_lkm
 	dmesg 
 	sudo dmesg -C
