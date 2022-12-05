@@ -13,3 +13,9 @@ unload:
 load:
 	sudo insmod my_lkm.ko
 	dmesg
+
+reader: 
+	gcc reader.c -o reader
+
+writer:
+	gcc writer.c -o writer

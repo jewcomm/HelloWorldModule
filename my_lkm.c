@@ -31,6 +31,9 @@ static struct mutex *pipeMutex;
 static char *current_ptr = NULL;
 static bool bufferCrowded;
 
+static bool isReader = false;
+static bool isWriter = false;
+
 int devNo;
 struct class *pClass;
 
@@ -52,12 +55,38 @@ static char *chr_devnode(struct device *dev, umode_t *mode){
 }
 
 static int device_open(struct inode *inode, struct file *file){
+    // define operations
+    int mode = (file->f_mode) & (FMODE_READ | FMODE_WRITE); 
+    // set type operations
+    if(mode == FMODE_READ) {
+        if(isReader) {
+            return -EBUSY;
+        }
+        //pr_cont("Is opened READ\n");
+        isReader = true;
+    } else if (mode == FMODE_WRITE) {
+        if(isWriter) {
+            return -EBUSY;
+        }
+        //pr_cont("Is opened WRITE\n");
+        isWriter = true;
+    }
+    //pr_cont("mode: %i", mode);
     pr_cont("device open\n");
     try_module_get(THIS_MODULE);
     return 0;
 }
 
 static int device_release(struct inode *inode, struct file *file) {
+    int mode = (file->f_mode) & (FMODE_READ | FMODE_WRITE); 
+    //unset type operations
+    if(mode == FMODE_READ) {
+        pr_cont("Is closed READ\n");
+        isReader = false;
+    } else if (mode == FMODE_WRITE) {
+        pr_cont("Is closed WRITE\n");
+        isWriter = false;
+    }
     module_put(THIS_MODULE);
     pr_cont("device reelase\n");
     return 0;
@@ -108,20 +137,22 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
 }
 
 static ssize_t device_read(struct file *flip, char __user *buffer, size_t len, loff_t *offset) {
+    pr_cont("read function: want read %i\n", len);
     mutex_lock(pipeMutex);
     int bytes_read;
-    
-    pr_cont("read function\n");
 
-    bytes_read = copy_to_user(buffer, msg_ptr, bufferWritten);
+    // temporary stub
+    if(bufferWritten < len) return -1;
+    
+    bytes_read = copy_to_user(buffer, msg_ptr, len);
     pr_cont("buffer: %s\n", buffer);
-    pr_cont("Readed: %li\n", bufferWritten - bytes_read);
+    pr_cont("Readed: %li\n", len - bytes_read);
 
     // need add check if bytes_read != 0
 
-    bytes_read = bufferWritten - bytes_read;
+    bytes_read = len - bytes_read;
 
-    bufferWritten = 0;
+    bufferWritten -= bytes_read;
     mutex_unlock(pipeMutex);
     return bytes_read;
 }
