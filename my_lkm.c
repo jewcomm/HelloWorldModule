@@ -258,4 +258,41 @@ static int __init hello_start(void){
 
     devNo = MKDEV(major_num, 0);
 
-    pClass = class_create(THIS_MODUL
+    pClass = class_create(THIS_MODULE, "x");
+    if(IS_ERR(pClass)) {
+        pr_alert("can't create class\n");
+        unregister_chrdev_region(devNo, 1);
+        kfree(msg_ptr);
+        return -1;
+    }
+    pClass->devnode = chr_devnode;
+
+    init_waitqueue_head(&reader_queue);
+
+    if (IS_ERR(pDev = device_create(pClass, NULL, devNo, NULL, DEVICE_NAME))){
+        pr_alert("my_lkm.ko cant create device /dev/my_lkm\n");
+        class_destroy(pClass);
+        unregister_chrdev_region(devNo, 1);
+        kfree(msg_ptr);
+        return -1;
+    }
+
+    pipeMutex = (struct mutex *)kzalloc(sizeof(struct mutex), GFP_KERNEL);
+    mutex_init(pipeMutex);
+
+    pr_cont("my_lkm module loaded with device major number %d\n", major_num);
+
+    return 0;
+}
+
+static void __exit hello_end(void)
+{
+    kfree(msg_ptr);
+    device_destroy(pClass, devNo);
+    class_destroy(pClass);
+    unregister_chrdev(major_num, DEVICE_NAME);
+    pr_info("Goodbye Mr.\n");
+}
+
+module_init(hello_start);
+module_exit(hello_end);
