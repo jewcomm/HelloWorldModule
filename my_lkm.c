@@ -24,6 +24,7 @@ static ssize_t device_write(struct file *, const char *, size_t, loff_t *);
 
 static int reader_counter = 0;
 static int writer_counter = 0;
+static int buff_cond = -1; // -1 empty, 0 part filled, 1 - fill (ring)
 
 static char *msg_ptr;
 
@@ -130,9 +131,7 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
 
         // rewrite already writer sumbols ;(
         if(writer_counter >= reader_counter) reader_counter = writer_counter;
-
-        mutex_unlock(pipeMutex);
-        return len;
+        buff_cond = 1;
     } else {
         notWritten = copy_from_user(msg_ptr + writer_counter, buffer, len);
         pr_cont("Len: %li\n", len);
@@ -144,85 +143,98 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
             return -1;
         }
         writer_counter += len - notWritten;
-        mutex_unlock(pipeMutex);
-        return len - notWritten;
+        buff_cond = 0;
     }
+
+    wake_up_interruptible(&reader_queue);
+    mutex_unlock(pipeMutex);
+    return len;
 }
 
 static ssize_t device_read(struct file *flip, char __user *buffer, size_t len, loff_t *offset) {
-    pr_cont("read function: want read %li\n", len);
-    mutex_lock(pipeMutex);
     int notReaded;
+    int availableRead;
 
-    int availableRead = 0;
+    pr_cont("read function: want read %li\n", len);
+    pr_alert("Reader counter: %i\n", reader_counter);
+    pr_alert("Writer counter: %i\n", writer_counter);
+    while (true) {
+        mutex_lock(pipeMutex);
+        if((reader_counter > writer_counter) || (reader_counter == writer_counter && buff_cond == 1)) {
+            // if buffer overflowed and works as ring buffer
+            availableRead = writer_counter + BUFFER_SIZE - reader_counter;
+            
+            pr_alert("[RING]Available read: %i\n", availableRead);
 
-    pr_alert("Reader counter: %li\n", reader_counter);
-    pr_alert("Writer counter: %li\n", writer_counter);
-    
-    if(reader_counter >= writer_counter) {
-        // if buffer overflowed and works as ring buffer
-        availableRead = writer_counter + BUFFER_SIZE - reader_counter;
-        pr_alert("[RING]Available read: %li\n", availableRead);
+            if(availableRead >= len) {
+                size_t rem = reader_counter + len;
+                if(rem > BUFFER_SIZE) {
+                    // if read from zero
+                    pr_alert("Rem: %li\n", rem);
+                    pr_alert("Reader counter: %i\n", reader_counter);
 
-        // temporary stub
-        // adding wait_queue
-        if(availableRead < len) {
-            mutex_unlock(pipeMutex);
-            return -1;
-        }
+                    notReaded = copy_to_user(buffer, msg_ptr + reader_counter, len - rem);
+                    if(notReaded) {
+                        pr_alert("ERROR! Fail copy_to_user.\n"); 
+                        mutex_unlock(pipeMutex);
+                        return -1;
+                    }
 
-        size_t rem = reader_counter + len - BUFFER_SIZE;
-        pr_alert("Rem: %li\n", rem);
-        pr_alert("Reader counter: %li\n", reader_counter);
+                    notReaded = copy_to_user(buffer + (len - rem), msg_ptr, rem);
+                    pr_alert("Buffer: %s\n", msg_ptr);
+                    if(notReaded) {
+                        pr_alert("ERROR! Fail copy_to_user.\n"); 
+                        mutex_unlock(pipeMutex);
+                        return -1;
+                    }
 
-        notReaded = copy_to_user(buffer, msg_ptr + reader_counter, len - rem);
-        if(notReaded) {
-            pr_alert("ERROR! Fail copy_to_user.\n"); 
-            mutex_unlock(pipeMutex);
-            return -1;
-        }
+                    reader_counter = rem;
+                    buff_cond = 0;
+                } else {
+                    notReaded = copy_to_user(buffer, msg_ptr + reader_counter, len);
+                    pr_cont("buffer: %s\n", buffer);
+                    pr_cont("Readed: %li\n", len - notReaded);
 
-        notReaded = copy_to_user(buffer + (len - rem), msg_ptr, rem);
-        pr_alert("Buffer: %s\n", msg_ptr);
-        if(notReaded) {
-            pr_alert("ERROR! Fail copy_to_user.\n"); 
-            mutex_unlock(pipeMutex);
-            return -1;
-        }
+                    if(notReaded) {
+                        pr_alert("ERROR! Fail copy_to_user.\n"); 
+                        mutex_unlock(pipeMutex);
+                        return -1;
+                    }
 
-        reader_counter = rem;
-        mutex_unlock(pipeMutex);
+                    reader_counter += len;
+                    buff_cond = 1;
+                }
 
-        return len;
-    } else {
-        availableRead = writer_counter - reader_counter;
-        pr_alert("[LINE]Available read: %li\n", availableRead);
+                mutex_unlock(pipeMutex);
+                return len;
+            }
+        } else if (reader_counter < writer_counter) {
+            availableRead = writer_counter - reader_counter;
+            pr_alert("[LINE]Available read: %i\n", availableRead);
 
-        // temporary stub
-        // adding wait_queue
-        if(availableRead < len) {
-            mutex_unlock(pipeMutex);
-            return -1;
-        }
+            // temporary stub
+            // adding wait_queue
+            if(availableRead >= len) {
+                notReaded = copy_to_user(buffer, msg_ptr + reader_counter, len);
+                pr_cont("buffer: %s\n", buffer);
+                pr_cont("Readed: %li\n", len - notReaded);
 
-        notReaded = copy_to_user(buffer, msg_ptr + reader_counter, len);
-        pr_cont("buffer: %s\n", buffer);
-        pr_cont("Readed: %li\n", len - notReaded);
+                if(notReaded) {
+                    pr_alert("ERROR! Fail copy_to_user.\n"); 
+                    mutex_unlock(pipeMutex);
+                    return -1;
+                }
 
-        // need add check if notReaded != 0
+                reader_counter += len;
 
-        if(notReaded) {
-            pr_alert("ERROR! Fail copy_to_user.\n"); 
-            mutex_unlock(pipeMutex);
-            return -1;
-        }
-
-        reader_counter += (len - notReaded);
-
-        mutex_unlock(pipeMutex);
-
-        return (len - notReaded);
-    }    
+                mutex_unlock(pipeMutex);
+                buff_cond = 0;
+                return len;
+            }
+        } 
+        mutex_unlock(pipeMutex);    
+        wait_event_interruptible(reader_queue, buff_cond >= 0);
+    }
 }
 
 static int __init hello_start(void){
@@ -246,41 +258,4 @@ static int __init hello_start(void){
 
     devNo = MKDEV(major_num, 0);
 
-    pClass = class_create(THIS_MODULE, "x");
-    if(IS_ERR(pClass)) {
-        pr_alert("can't create class\n");
-        unregister_chrdev_region(devNo, 1);
-        kfree(msg_ptr);
-        return -1;
-    }
-    pClass->devnode = chr_devnode;
-
-    init_waitqueue_head(&reader_queue);
-
-    if (IS_ERR(pDev = device_create(pClass, NULL, devNo, NULL, DEVICE_NAME))){
-        pr_alert("my_lkm.ko cant create device /dev/my_lkm\n");
-        class_destroy(pClass);
-        unregister_chrdev_region(devNo, 1);
-        kfree(msg_ptr);
-        return -1;
-    }
-
-    pipeMutex = (struct mutex *)kzalloc(sizeof(struct mutex), GFP_KERNEL);
-    mutex_init(pipeMutex);
-
-    pr_cont("my_lkm module loaded with device major number %d\n", major_num);
-
-    return 0;
-}
-
-static void __exit hello_end(void)
-{
-    kfree(msg_ptr);
-    device_destroy(pClass, devNo);
-    class_destroy(pClass);
-    unregister_chrdev(major_num, DEVICE_NAME);
-    pr_info("Goodbye Mr.\n");
-}
-  
-module_init(hello_start);
-module_exit(hello_end);
+    pClass = class_create(THIS_MODUL
