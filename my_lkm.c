@@ -5,6 +5,7 @@
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/mutex.h>
+#include <linux/wait.h>
 
 
 MODULE_LICENSE("GPL");
@@ -14,31 +15,29 @@ MODULE_VERSION("0.1");
 
 #define DEVICE_NAME "my_lkm"
 
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 32
 
 static int device_open(struct inode *, struct file *);
 static int device_release(struct inode *, struct file *);
 static ssize_t device_read(struct file *, char *, size_t, loff_t *);
 static ssize_t device_write(struct file *, const char *, size_t, loff_t *);
 
-static size_t bufferWritten = 0;
+static int reader_counter = 0;
+static int writer_counter = 0;
 
 static char *msg_ptr;
 
 static struct mutex *pipeMutex;
 
-// current_ptr will pointing on buffer first symb if buffer crowded
-static char *current_ptr = NULL;
-static bool bufferCrowded;
-
 static bool isReader = false;
 static bool isWriter = false;
+
+static wait_queue_head_t reader_queue;
 
 int devNo;
 struct class *pClass;
 
 static int major_num;
-static int device_open_count = 0;
 
 static struct file_operations fops = {
     .owner = THIS_MODULE,
@@ -100,11 +99,12 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
     // hmm... Is it worth considering?
     if(len > BUFFER_SIZE) len = BUFFER_SIZE;
 
-    if(bufferWritten + len > BUFFER_SIZE) {
-        size_t rem = bufferWritten + len - BUFFER_SIZE;
-        notWritten = copy_from_user(msg_ptr + bufferWritten, buffer, len - rem);
+    if(writer_counter + len > BUFFER_SIZE) {
+        size_t rem = writer_counter + len - BUFFER_SIZE;
+        notWritten = copy_from_user(msg_ptr + writer_counter, buffer, len - rem);
         if(notWritten) { 
             pr_alert("ERROR! Fail copy_from_user.\n"); 
+            mutex_unlock(pipeMutex);
             return -1;
         }
         
@@ -113,38 +113,42 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
         notWritten = copy_from_user(msg_ptr, buffer + rem, rem);
         if(notWritten) { 
             pr_alert("ERROR! Fail copy_from_user.\n"); 
+            mutex_unlock(pipeMutex);
             return -1;
         }
 
-        current_ptr = msg_ptr + rem;
-        bufferWritten = rem;
+        writer_counter = rem;
 
         mutex_unlock(pipeMutex);
         return len;
     } else {
-        notWritten = copy_from_user(msg_ptr + bufferWritten, buffer, len);
-        bufferWritten += len;
+        notWritten = copy_from_user(msg_ptr + writer_counter, buffer, len);
         pr_cont("Len: %li\n", len);
         pr_cont("Writed: %li\n", len - notWritten);
         
         if(notWritten) { 
             pr_alert("ERROR! Fail copy_from_user.\n"); 
+            mutex_unlock(pipeMutex);
             return -1;
         }
+        writer_counter += len - notWritten;
         mutex_unlock(pipeMutex);
         return len - notWritten;
     }
 }
 
 static ssize_t device_read(struct file *flip, char __user *buffer, size_t len, loff_t *offset) {
-    pr_cont("read function: want read %i\n", len);
+    pr_cont("read function: want read %li\n", len);
     mutex_lock(pipeMutex);
     int bytes_read;
 
     // temporary stub
-    if(bufferWritten < len) return -1;
+    if(writer_counter < len) {
+        mutex_unlock(pipeMutex);
+        return -1;
+    }
     
-    bytes_read = copy_to_user(buffer, msg_ptr, len);
+    bytes_read = copy_to_user(buffer, msg_ptr + reader_counter, len);
     pr_cont("buffer: %s\n", buffer);
     pr_cont("Readed: %li\n", len - bytes_read);
 
@@ -152,7 +156,8 @@ static ssize_t device_read(struct file *flip, char __user *buffer, size_t len, l
 
     bytes_read = len - bytes_read;
 
-    bufferWritten -= bytes_read;
+    writer_counter -= bytes_read;
+    reader_counter += bytes_read;
     mutex_unlock(pipeMutex);
     return bytes_read;
 }
@@ -186,6 +191,8 @@ static int __init hello_start(void){
         return -1;
     }
     pClass->devnode = chr_devnode;
+
+    init_waitqueue_head(&reader_queue);
 
     if (IS_ERR(pDev = device_create(pClass, NULL, devNo, NULL, DEVICE_NAME))){
         pr_alert("my_lkm.ko cant create device /dev/my_lkm\n");
