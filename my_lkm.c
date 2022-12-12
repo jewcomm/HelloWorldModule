@@ -25,6 +25,7 @@ static ssize_t device_write(struct file *, const char *, size_t, loff_t *);
 static int reader_counter = 0;
 static int writer_counter = 0;
 static int buff_cond = -1; // -1 empty, 0 part filled, 1 - fill (ring)
+static int availableRead = 0;
 
 static char *msg_ptr;
 
@@ -95,26 +96,26 @@ static int device_release(struct inode *inode, struct file *file) {
 static ssize_t device_write(struct file *flip, const char __user *buffer, size_t len, loff_t *offset) {
     size_t notWritten; 
 
+    pr_cont("\n\n-----DEVICE WRITE BEGIN-----\n");
+    pr_cont("Reader counter: %i\n", reader_counter);
+    pr_cont("Writer counter: %i\n", writer_counter);
+    pr_cont("Avaible: %i", availableRead);
+    pr_cont("Buffer condition: %i\n", buff_cond);
+
     mutex_lock(pipeMutex);
-    pr_cont("write function\n");
     // hmm... Is it worth considering?
     if(len > BUFFER_SIZE) len = BUFFER_SIZE;
 
-    if(writer_counter + len > BUFFER_SIZE) {
+    if(writer_counter + len >= BUFFER_SIZE) {
         // ring writing
+        pr_cont("RING WRITING\n");
         size_t rem = writer_counter + len - BUFFER_SIZE;
-        pr_cont("buffer before rewrite: %s\n", msg_ptr);
         notWritten = copy_from_user(msg_ptr + writer_counter, buffer, len - rem);
         if(notWritten) { 
             pr_alert("ERROR! Fail copy_from_user.\n"); 
             mutex_unlock(pipeMutex);
             return -1;
         }
-
-        pr_cont("Len: %li\n", len);
-        pr_cont("Writed: %li\n", len - notWritten);
-
-        pr_cont("buffer after 1 part rewrite: %s\n", msg_ptr);
         
         // if can't write some part, 
         // it's correct idea?
@@ -125,53 +126,70 @@ static ssize_t device_write(struct file *flip, const char __user *buffer, size_t
             return -1;
         }
 
-        pr_cont("buffer after rewrite: %s\n", msg_ptr);
-
         writer_counter = rem;
+        availableRead += rem;
 
         // rewrite already writer sumbols ;(
-        if(writer_counter >= reader_counter) reader_counter = writer_counter;
+        if(writer_counter >= reader_counter) { 
+            reader_counter = writer_counter; 
+            availableRead = BUFFER_SIZE;
+        }
         buff_cond = 1;
     } else {
         notWritten = copy_from_user(msg_ptr + writer_counter, buffer, len);
-        pr_cont("Len: %li\n", len);
-        pr_cont("Writed: %li\n", len - notWritten);
-        
+        pr_cont("LINE WRITING\n");
         if(notWritten) { 
             pr_alert("ERROR! Fail copy_from_user.\n"); 
             mutex_unlock(pipeMutex);
             return -1;
         }
-        writer_counter += len - notWritten;
-        buff_cond = 0;
+        writer_counter += len;
+        availableRead += len;
+        // rewrite already writer sumbols ;(
+        if(writer_counter >= reader_counter && buff_cond == 1) { 
+            reader_counter = writer_counter; 
+            availableRead = BUFFER_SIZE;
+            buff_cond = 1;
+        } else if(availableRead <= reader_counter) {
+            buff_cond = 0;
+        }
     }
 
     wake_up_interruptible(&reader_queue);
     mutex_unlock(pipeMutex);
+    pr_cont("Reader counter: %i\n", reader_counter);
+    pr_cont("Writer counter: %i\n", writer_counter);
+    pr_cont("Avaible: %i", availableRead);
+    pr_cont("Buffer condition: %i\n", buff_cond);
+    pr_cont("-----DEVICE WRITE END-----\n");
     return len;
 }
 
 static ssize_t device_read(struct file *flip, char __user *buffer, size_t len, loff_t *offset) {
     int notReaded;
-    int availableRead;
 
-    pr_cont("read function: want read %li\n", len);
-    pr_alert("Reader counter: %i\n", reader_counter);
-    pr_alert("Writer counter: %i\n", writer_counter);
+    pr_cont("\n\n-----DEVICE READ BEGIN-----\n");   
     while (true) {
         mutex_lock(pipeMutex);
+
+        pr_cont("Reader counter: %i\n", reader_counter);
+        pr_cont("Writer counter: %i\n", writer_counter);
+        pr_cont("Avaible: %i\n", availableRead);
+        pr_cont("Buffer condition: %i\n", buff_cond);
+
         if((reader_counter > writer_counter) || (reader_counter == writer_counter && buff_cond == 1)) {
             // if buffer overflowed and works as ring buffer
             availableRead = writer_counter + BUFFER_SIZE - reader_counter;
             
-            pr_alert("[RING]Available read: %i\n", availableRead);
+            pr_alert("RING READING\n: %i\n", availableRead);
 
             if(availableRead >= len) {
                 size_t rem = reader_counter + len;
                 if(rem > BUFFER_SIZE) {
                     // if read from zero
+                    rem -= BUFFER_SIZE;
                     pr_alert("Rem: %li\n", rem);
-                    pr_alert("Reader counter: %i\n", reader_counter);
+                    
 
                     notReaded = copy_to_user(buffer, msg_ptr + reader_counter, len - rem);
                     if(notReaded) {
@@ -204,7 +222,12 @@ static ssize_t device_read(struct file *flip, char __user *buffer, size_t len, l
                     reader_counter += len;
                     buff_cond = 1;
                 }
-
+                availableRead -= len;
+                pr_cont("Reader counter: %i\n", reader_counter);
+                pr_cont("Writer counter: %i\n", writer_counter);
+                pr_cont("Avaible: %i", availableRead);
+                pr_cont("Buffer condition: %i\n", buff_cond);
+                pr_cont("-----DEVICE READ END-----\n");
                 mutex_unlock(pipeMutex);
                 return len;
             }
@@ -226,14 +249,26 @@ static ssize_t device_read(struct file *flip, char __user *buffer, size_t len, l
                 }
 
                 reader_counter += len;
+                availableRead -= len;
 
                 mutex_unlock(pipeMutex);
                 buff_cond = 0;
+                pr_cont("Reader counter: %i\n", reader_counter);
+                pr_cont("Writer counter: %i\n", writer_counter);
+                pr_cont("Avaible: %i", availableRead);
+                pr_cont("Buffer condition: %i\n", buff_cond);
+                pr_cont("-----DEVICE READ END-----\n");
                 return len;
             }
         } 
         mutex_unlock(pipeMutex);    
-        wait_event_interruptible(reader_queue, buff_cond >= 0);
+        pr_cont("Reader counter: %i\n", reader_counter);
+        pr_cont("Writer counter: %i\n", writer_counter);
+        pr_cont("Avaible: %i", availableRead);
+        pr_cont("Buffer condition: %i\n", buff_cond);
+        pr_cont("-----DEVICE READ SLEEP-----\n");
+        wait_event_interruptible(reader_queue, availableRead >= len);
+        pr_cont("-----DEVICE READ WAKEUP-----\n");
     }
 }
 
