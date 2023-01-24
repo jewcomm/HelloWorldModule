@@ -8,7 +8,6 @@
 #include <linux/wait.h>
 #include <linux/list.h>
 
-
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Alex Navrotskij");
 MODULE_DESCRIPTION("Simple Hello World module!");
@@ -16,11 +15,13 @@ MODULE_VERSION("0.1");
 
 #define DEVICE_NAME "my_lkm"
 #define BUFFER_SIZE 32
+#define PIPE_SET_NEW_BUFFER_SIZE 0x30
 
 static int device_open(struct inode *, struct file *);
 static int device_release(struct inode *, struct file *);
 static ssize_t device_read(struct file *, char *, size_t, loff_t *);
 static ssize_t device_write(struct file *, const char *, size_t, loff_t *);
+static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 static struct mutex *myPipeMutex;
 
@@ -39,6 +40,8 @@ struct myPipe
 
     int buffCond; // -1 empty, 0 part filled, 1 - fill (ring)
 
+    int bufferSize;
+
     bool isReader;
     bool isWriter;
 
@@ -53,19 +56,21 @@ struct myPipe
 
 struct myPipe* pipes;
 
-struct myPipe* myPipeInit(void){
+struct myPipe* myPipeInit(int bSize){
     struct myPipe* newPipe;
 
     newPipe = (struct myPipe*)kmalloc(sizeof(struct myPipe), GFP_USER);
     if(newPipe == NULL) return NULL;
 
-    newPipe->msgPtr = (char*)kmalloc(BUFFER_SIZE, GFP_USER);
+    newPipe->bufferSize = bSize;
+
+    newPipe->msgPtr = (char*)kmalloc(bSize, GFP_USER);
     if(newPipe->msgPtr == NULL) { 
         kfree(newPipe);
         return NULL; 
     }
 
-    newPipe->rwMutex = (struct mutex*)kmalloc(sizeof(struct mutex), GFP_KERNEL);
+    newPipe->rwMutex = (struct mutex*)kmalloc(sizeof(struct mutex), GFP_USER);
     if(newPipe->rwMutex == NULL){
         kfree(newPipe);
         kfree(newPipe->msgPtr);
@@ -110,7 +115,8 @@ static struct file_operations fops = {
     .read = device_read,
     .write = device_write,
     .open = device_open,
-    .release = device_release    
+    .release = device_release,
+    .unlocked_ioctl = device_ioctl
 };
 
 static char *chr_devnode(struct device *dev, umode_t *mode){
@@ -123,10 +129,12 @@ static int device_open(struct inode *inode, struct file *file){
     struct myPipe* temp;
     int mode;
 
+    pr_cont("Device Open\n");
+
     mutex_lock(myPipeMutex);
 
     if(!pipes){
-        pipes = myPipeInit();
+        pipes = myPipeInit(BUFFER_SIZE);
         if(!pipes) {
             mutex_unlock(myPipeMutex);
             return -1;
@@ -136,7 +144,7 @@ static int device_open(struct inode *inode, struct file *file){
         struct myPipe* t_pipe = findByUserId(pipes, current_uid().val);
 
         if(!t_pipe){
-            if(!(t_pipe = myPipeInit())){
+            if(!(t_pipe = myPipeInit(BUFFER_SIZE))){
                 mutex_unlock(myPipeMutex);
                 return -1;
             }
@@ -196,6 +204,28 @@ static int device_release(struct inode *inode, struct file *file) {
     return 0;
 }
 
+static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg){
+    struct myPipe* temp = file->private_data;
+
+    switch (cmd)
+    {
+    case PIPE_SET_NEW_BUFFER_SIZE:
+        pr_cont("\n----ICOTL----\n");
+        pr_cont("Received value: %li\n", arg);
+        temp->bufferSize = arg;
+        temp->msgPtr = krealloc(temp->msgPtr, arg, GFP_USER);
+        if((temp->msgPtr) == NULL) {
+            pr_alert("ERROR!!!! KREALLOC RETURNED NULL\n");
+        }
+        break;
+    
+    default:
+        pr_alert("Error code 0x%x int ioctl\n", cmd);
+        return -1;
+    }
+    return 0;
+}
+
 static ssize_t device_write(struct file *file, const char __user *buffer, size_t len, loff_t *offset) {
     struct myPipe* temp = file->private_data;   
     size_t notWritten; 
@@ -210,12 +240,12 @@ static ssize_t device_write(struct file *file, const char __user *buffer, size_t
     pr_cont("Buffer condition: %i\n", temp->buffCond);
 
     // hmm... Is it worth considering?
-    if(len > BUFFER_SIZE) len = BUFFER_SIZE;
+    if(len > (temp->bufferSize)) len = (temp->bufferSize);
 
-    if((temp->writerCounter) + len >= BUFFER_SIZE) {
+    if((temp->writerCounter) + len >= (temp->bufferSize)) {
         // ring writing
         pr_cont("RING WRITING\n");
-        rem = (temp->writerCounter) + len - BUFFER_SIZE;
+        rem = (temp->writerCounter) + len - (temp->bufferSize);
         notWritten = copy_from_user((temp->msgPtr) + temp->writerCounter, buffer, len - rem);
         if(notWritten) { 
             pr_alert("ERROR! Fail copy_from_user.\n"); 
@@ -238,7 +268,7 @@ static ssize_t device_write(struct file *file, const char __user *buffer, size_t
         // rewrite already writer sumbols ;(
         if(temp->writerCounter >= temp->readerCounter) { 
             temp->readerCounter = temp->writerCounter; 
-            temp->availableRead = BUFFER_SIZE;
+            temp->availableRead = (temp->bufferSize);
         }
         temp->buffCond = 1;
     } else {
@@ -254,7 +284,7 @@ static ssize_t device_write(struct file *file, const char __user *buffer, size_t
         // rewrite already writer sumbols ;(
         if(temp->writerCounter >= temp->readerCounter && temp->buffCond == 1) { 
             temp->readerCounter = temp->writerCounter; 
-            temp->availableRead = BUFFER_SIZE;
+            temp->availableRead = (temp->bufferSize);
             temp->buffCond = 1;
         } else if(temp->availableRead <= temp->readerCounter) {
             temp->buffCond = 0;
@@ -287,15 +317,15 @@ static ssize_t device_read(struct file *file, char __user *buffer, size_t len, l
 
         if((temp->readerCounter > temp->writerCounter) || (temp->readerCounter == temp->writerCounter && temp->buffCond == 1)) {
             // if buffer overflowed and works as ring buffer
-            temp->availableRead = temp->writerCounter + BUFFER_SIZE - temp->readerCounter;
+            temp->availableRead = temp->writerCounter + (temp->bufferSize) - temp->readerCounter;
             
             pr_alert("RING READING\n: %i\n", temp->availableRead);
 
             if(temp->availableRead >= len) {
                 size_t rem = temp->readerCounter + len;
-                if(rem > BUFFER_SIZE) {
+                if(rem > (temp->bufferSize)) {
                     // if read from zero
-                    rem -= BUFFER_SIZE;
+                    rem -= (temp->bufferSize);
                     pr_alert("Rem: %li\n", rem);
                     
 
